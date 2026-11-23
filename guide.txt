@@ -1,0 +1,1561 @@
+ПОЛНЫЙ ПОШАГОВЫЙ ГАЙД ДЕМО 2027
+Основа: «Гайд Демо 2027 [ver.1.0.3 Build 4]», 81 страница.
+Стенд: PNETLab, Debian 13, 7 узлов.
+
+ВАЖНО
+- Команды ниже выполняются от root, если отдельно не указано другое.
+- В nano сохранить: Ctrl+O, Enter; выйти: Ctrl+X.
+- В PNETLab подключите Additional.iso к нужной ВМ через CD/DVD и смонтируйте/откройте образ. В гайде он извлекается через Xarchiver в /root. После извлечения файлы находятся в /root/Additional.
+- Перед сетевыми изменениями проверьте имена интерфейсов: ip -br a.
+- Не вставляйте команды с приглашением root@...# — вводится только сама команда.
+- Пароли и адреса приведены по исходному PDF. Если в вашей топологии интерфейсы названы иначе, заменяйте только имя интерфейса, не IP.
+
+0. СОЗДАНИЕ СТЕНДА В PNETLAB
+
+Создайте топологию:
+1) Net: cloud_nat
+2) ISP: 1 CPU, 1024 MB RAM, 3 Ethernet
+3) HQ-RTR: 1 CPU, 1024 MB RAM, 4 Ethernet
+4) BR-RTR: 1 CPU, 1024 MB RAM, 2 Ethernet
+5) BR-FW: 1 CPU, 1024 MB RAM, 2 Ethernet
+6) HQ-SRV: 1 CPU, 1024 MB RAM, 1 Ethernet
+7) HQ-CLI: 1 CPU, 1024 MB RAM, 1 Ethernet
+8) BR-SRV: 1 CPU, 1024 MB RAM, 1 Ethernet
+Все узлы — Debian 13.
+
+Соединения:
+cloud_nat — ISP ens3
+ISP ens4 — HQ-RTR ens3
+ISP ens5 — BR-RTR ens3
+HQ-RTR ens4 — HQ-SRV ens3 (после настройки OVS будет VLAN 100)
+HQ-RTR ens5 — HQ-CLI ens3 (VLAN 200)
+HQ-RTR ens6 — VLAN 999 для управления
+BR-RTR ens4 — BR-FW ens3
+BR-FW ens4 — BR-SRV ens3
+
+Стандартный вход на всех машинах:
+Логин root
+Пароль Test123
+
+1. ПЕРВИЧНАЯ ПОДГОТОВКА НА ВСЕХ УСТРОЙСТВАХ
+
+На каждой ВМ откройте терминал:
+nano /etc/apt/sources.list
+
+Найдите первую строку с cdrom и поставьте в её начале #. Сохранить Ctrl+O, Enter, выйти Ctrl+X.
+
+Обновить списки пакетов:
+apt update
+
+Задайте FQDN на соответствующих машинах:
+
+ISP:
+hostnamectl set-hostname isp.au-team.irpo
+
+HQ-RTR:
+hostnamectl set-hostname hq-rtr.au-team.irpo
+
+HQ-SRV:
+hostnamectl set-hostname hq-srv.au-team.irpo
+
+HQ-CLI:
+hostnamectl set-hostname hq-cli.au-team.irpo
+
+BR-RTR:
+hostnamectl set-hostname br-rtr.au-team.irpo
+
+BR-FW:
+hostnamectl set-hostname br-fw.au-team.irpo
+
+BR-SRV:
+hostnamectl set-hostname br-srv.au-team.irpo
+
+Чтобы обновить приглашение терминала:
+exec bash
+
+2. АДРЕСАЦИЯ (МОДУЛЬ 1, ЗАДАНИЕ 1)
+
+Используйте следующую таблицу:
+
+ISP:
+ens3 — DHCP (интернет)
+ens4 — 172.16.1.1/28
+ens5 — 172.16.2.1/28
+
+HQ-RTR:
+ens3 — 172.16.1.2/28, шлюз 172.16.1.1
+ens4 — 192.168.100.1/27
+ens5 — 192.168.200.1/28
+ens6 — 192.168.99.1/29
+
+HQ-SRV:
+ens3 — 192.168.100.2/27, шлюз 192.168.100.1
+
+HQ-CLI:
+временно 192.168.200.5/28, шлюз 192.168.200.1
+позже перевести на DHCP
+
+BR-RTR:
+ens3 — 172.16.2.2/28, шлюз 172.16.2.1
+ens4 — 172.16.10.1/30
+
+BR-FW:
+ens3 — 172.16.10.2/30, шлюз 172.16.10.1
+ens4 — 172.16.20.1/28
+
+BR-SRV:
+ens3 — 172.16.20.2/28, шлюз 172.16.20.1
+
+2.1. ISP — настройка интерфейсов
+
+nano /etc/network/interfaces
+
+Приведите файл к виду:
+
+source /etc/network/interfaces.d/*
+
+auto lo
+iface lo inet loopback
+
+auto ens3
+iface ens3 inet dhcp
+
+auto ens4
+iface ens4 inet static
+address 172.16.1.1/28
+
+auto ens5
+iface ens5 inet static
+address 172.16.2.1/28
+
+post-up nft -f /etc/nftables.conf
+
+Сохранить и выйти.
+
+2.2. Включить маршрутизацию IPv4 на ISP, HQ-RTR, BR-RTR, BR-FW
+
+На каждом из четырёх узлов:
+nano /etc/sysctl.d/sysctl.conf
+
+Вписать:
+net.ipv4.ip_forward=1
+
+Сохранить, затем применить:
+sysctl --system
+
+2.3. Настроить NAT на ISP, HQ-RTR, BR-RTR, BR-FW
+
+На каждом из четырёх узлов:
+nano /etc/nftables.conf
+
+Содержимое для NAT:
+
+#!/usr/sbin/nft -f
+
+flush ruleset
+
+table ip nat {
+    chain postrouting {
+        type nat hook postrouting priority 100; policy accept
+        meta l4proto { gre, ipip, ospf } counter return
+        masquerade
+    }
+}
+
+table inet filter {
+    chain input {
+        type filter hook input priority filter;
+    }
+    chain forward {
+        type filter hook forward priority filter;
+    }
+    chain output {
+        type filter hook output priority filter;
+    }
+}
+
+Сохранить. На ISP дополнительно применить:
+nft -f /etc/nftables.conf
+
+2.4. HQ-RTR
+
+nano /etc/network/interfaces
+
+source /etc/network/interfaces.d/*
+
+auto lo
+iface lo inet loopback
+
+auto ens3
+iface ens3 inet static
+address 172.16.1.2/28
+gateway 172.16.1.1
+
+auto ens4
+iface ens4 inet static
+address 192.168.100.1/27
+
+auto ens5
+iface ens5 inet static
+address 192.168.200.1/28
+
+auto ens6
+iface ens6 inet static
+address 192.168.99.1/29
+
+post-up nft -f /etc/nftables.conf
+
+2.5. HQ-SRV
+
+nano /etc/network/interfaces
+
+source /etc/network/interfaces.d/*
+
+auto lo
+iface lo inet loopback
+
+auto ens3
+iface ens3 inet static
+address 192.168.100.2/27
+gateway 192.168.100.1
+
+2.6. HQ-CLI (временно статический адрес)
+
+nano /etc/network/interfaces
+
+source /etc/network/interfaces.d/*
+
+auto lo
+iface lo inet loopback
+
+auto ens3
+iface ens3 inet static
+address 192.168.200.5/28
+gateway 192.168.200.1
+
+2.7. BR-RTR
+
+nano /etc/network/interfaces
+
+source /etc/network/interfaces.d/*
+
+auto lo
+iface lo inet loopback
+
+auto ens3
+iface ens3 inet static
+address 172.16.2.2/28
+gateway 172.16.2.1
+
+auto ens4
+iface ens4 inet static
+address 172.16.10.1/30
+
+post-up nft -f /etc/nftables.conf
+
+2.8. BR-FW
+
+nano /etc/network/interfaces
+
+source /etc/network/interfaces.d/*
+
+auto lo
+iface lo inet loopback
+
+auto ens3
+iface ens3 inet static
+address 172.16.10.2/30
+gateway 172.16.10.1
+
+auto ens4
+iface ens4 inet static
+address 172.16.20.1/28
+
+post-up nft -f /etc/nftables.conf
+
+2.9. BR-SRV
+
+nano /etc/network/interfaces
+
+source /etc/network/interfaces.d/*
+
+auto lo
+iface lo inet loopback
+
+auto ens3
+iface ens3 inet static
+address 172.16.20.2/28
+gateway 172.16.20.1
+
+2.10. Перезапустить сеть
+
+На каждом узле после изменения interfaces:
+systemctl restart networking
+
+Проверить:
+ip -br a
+ip route
+
+Если интерфейсы/адреса не поднялись, в гайде рекомендовано по очереди:
+systemctl restart NetworkManager
+systemctl restart networking
+
+В крайнем случае:
+reboot
+
+Проверка интернета с HQ-SRV:
+ping -c 3 8.8.8.8
+
+3. ЛОКАЛЬНЫЕ ПОЛЬЗОВАТЕЛИ (МОДУЛЬ 1, ЗАДАНИЕ 3)
+
+3.1. На HQ-RTR и BR-RTR создать net_admin
+
+На каждом маршрутизаторе:
+useradd -m net_admin
+passwd net_admin
+
+Задайте пароль:
+P@ssw0rd
+
+Добавить пользователя в sudo:
+usermod -aG sudo net_admin
+
+Открыть sudoers:
+visudo
+
+В конец добавить:
+net_admin ALL=(ALL) NOPASSWD: ALL
+
+Сохранить и выйти.
+
+3.2. На HQ-SRV и BR-SRV создать sshuser
+
+На каждом сервере:
+useradd -m -u 2027 sshuser
+passwd sshuser
+
+Задайте пароль:
+P@ssw0rd
+
+Добавить в sudo:
+usermod -aG sudo sshuser
+
+Открыть:
+visudo
+
+В конец добавить:
+sshuser ALL=(ALL) NOPASSWD: ALL
+
+Проверка:
+id sshuser
+su - sshuser
+sudo id
+
+4. VLAN И OPEN VSWITCH (МОДУЛЬ 1, ЗАДАНИЕ 4)
+
+На HQ-RTR:
+apt update
+apt install -y openvswitch-switch
+
+Создать виртуальный коммутатор:
+ovs-vsctl add-br hq-sw
+
+Добавить физические интерфейсы с тегами:
+ovs-vsctl add-port hq-sw ens4 tag=100
+ovs-vsctl add-port hq-sw ens5 tag=200
+ovs-vsctl add-port hq-sw ens6 tag=999
+
+Добавить VLAN-интерфейсы:
+ovs-vsctl add-port hq-sw vlan100 tag=100 -- set interface vlan100 type=internal
+ovs-vsctl add-port hq-sw vlan200 tag=200 -- set interface vlan200 type=internal
+ovs-vsctl add-port hq-sw vlan999 tag=999 -- set interface vlan999 type=internal
+
+Теперь в /etc/network/interfaces на HQ-RTR замените настройки адресов на VLAN-интерфейсы. В итоге фрагмент должен выглядеть так:
+
+auto ens3
+iface ens3 inet static
+address 172.16.1.2/28
+gateway 172.16.1.1
+
+auto vlan100
+iface vlan100 inet static
+address 192.168.100.1/27
+
+auto vlan200
+iface vlan200 inet static
+address 192.168.200.1/28
+
+auto vlan999
+iface vlan999 inet static
+address 192.168.99.1/29
+
+post-up nft -f /etc/nftables.conf
+post-up ip link set hq-sw up
+
+Перезапустить сеть:
+systemctl restart networking
+
+В гайде указано, что после перезапуска IP могут задвоиться. Если так произошло:
+reboot
+
+Проверка на HQ-RTR:
+ip -br a
+ping -c 3 192.168.100.2
+ping -c 3 192.168.200.5
+
+Проверить управление по VLAN999:
+apt install -y openssh-server
+
+С HQ-SRV:
+ssh net_admin@192.168.99.1
+
+При первом подключении ответить yes, пароль P@ssw0rd.
+
+5. SSH НА HQ-SRV И BR-SRV (МОДУЛЬ 1, ЗАДАНИЕ 5)
+
+На обоих серверах:
+apt update
+apt install -y openssh-server
+
+На каждом сервере открыть:
+nano /etc/ssh/sshd_config
+
+Добавить/изменить параметры:
+Port 2027
+AllowUsers sshuser
+MaxAuthTries 2
+Banner /etc/ssh_banner
+
+Создать файл баннера:
+nano /etc/ssh_banner
+
+Содержимое:
+************************
+* Authorized access only *
+************************
+
+Перезапустить SSH:
+systemctl restart ssh
+
+Проверка с HQ-CLI:
+ssh sshuser@192.168.100.2 -p 2027
+
+Пароль P@ssw0rd. Должен появиться баннер Authorized access only.
+
+Для BR-SRV аналогично проверить:
+ssh sshuser@172.16.20.2 -p 2027
+(если проверяете из сети, имеющей маршрут до BR-SRV).
+
+6. GRE-ТУННЕЛЬ МЕЖДУ HQ И BR (МОДУЛЬ 1, ЗАДАНИЕ 6)
+
+6.1. HQ-RTR — создать туннель через nmtui
+
+На HQ-RTR:
+nmtui
+
+Далее:
+1) «Редактировать подключение».
+2) «Добавить».
+3) «Туннель IP».
+4) Имя профиля: gre
+5) Устройство: tun1
+6) Режим: GRE
+7) Родительский интерфейс: ens3
+8) Локальный IP: 172.16.1.2
+9) Удалённый IP: 172.16.2.2
+10) IPv4 — вручную.
+11) Адрес: 10.10.10.1/30
+12) ОК, сохранить.
+
+Открыть:
+nano /etc/network/interfaces
+
+В конец добавить:
+post-up ip link set gre0 up
+
+Задать TTL:
+nmcli connection modify gre ip-tunnel.ttl 64
+
+Перезапустить:
+systemctl restart networking
+
+6.2. BR-RTR
+
+На BR-RTR:
+nmtui
+
+«Редактировать подключение» → «Добавить» → «Туннель IP».
+
+Параметры:
+Имя профиля: gre
+Устройство: tun1
+Режим: GRE
+Родительский интерфейс: ens3
+Локальный IP: 172.16.2.2
+Удалённый IP: 172.16.1.2
+IPv4 вручную
+Адрес: 10.10.10.2/30
+
+Сохранить.
+
+Открыть:
+nano /etc/network/interfaces
+
+Добавить:
+post-up ip link set gre0 up
+
+Задать TTL:
+nmcli connection modify gre ip-tunnel.ttl 64
+
+Перезапустить:
+systemctl restart networking
+
+Проверка:
+На HQ-RTR:
+ping -c 3 10.10.10.2
+
+На BR-RTR:
+ping -c 3 10.10.10.1
+
+7. OSPF ЧЕРЕЗ FRR (МОДУЛЬ 1, ЗАДАНИЕ 7)
+
+На HQ-RTR, BR-RTR, BR-FW:
+apt update
+apt install -y frr
+
+На каждом:
+nano /etc/frr/daemons
+
+Найдите строку ospfd=no и замените:
+ospfd=yes
+
+Сохранить. Включить службу:
+systemctl enable --now frr
+systemctl restart frr
+
+7.1. HQ-RTR
+
+Открыть CLI FRR:
+vtysh
+
+Ввести по очереди:
+configure terminal
+interface gre0
+ip ospf message-digest-key 1 md5 P@ssw0rd
+exit
+router ospf
+router-id 1.1.1.1
+area 0 authentication message-digest
+network 10.10.10.0/30 area 0
+network 192.168.100.0/27 area 0
+network 192.168.200.0/28 area 0
+network 192.168.99.0/29 area 0
+exit
+exit
+write memory
+exit
+
+7.2. BR-RTR
+
+vtysh
+
+configure terminal
+interface gre0
+ip ospf message-digest-key 1 md5 P@ssw0rd
+exit
+interface ens4
+ip ospf message-digest-key 1 md5 P@ssw0rd
+exit
+router ospf
+router-id 2.2.2.2
+area 0 authentication message-digest
+network 10.10.10.0/30 area 0
+network 172.16.10.0/30 area 0
+exit
+exit
+write memory
+exit
+
+7.3. BR-FW
+
+vtysh
+
+configure terminal
+interface ens3
+ip ospf message-digest-key 1 md5 P@ssw0rd
+exit
+router ospf
+router-id 3.3.3.3
+area 0 authentication message-digest
+network 172.16.10.0/30 area 0
+network 172.16.20.0/28 area 0
+exit
+exit
+write memory
+exit
+
+Перезагрузить все три узла:
+reboot
+
+Проверка соседства на каждом маршрутизаторе:
+vtysh
+show ip ospf neighbor
+exit
+
+Должно быть состояние Full. Проверить связь между офисами ping-ом.
+
+Если FRR не поднялся:
+systemctl restart NetworkManager
+sleep 3
+systemctl restart frr
+
+8. DHCP ДЛЯ HQ-CLI (МОДУЛЬ 1, ЗАДАНИЕ 9)
+
+На HQ-RTR:
+apt install -y isc-dhcp-server
+
+Открыть:
+nano /etc/default/isc-dhcp-server
+
+Указать интерфейс:
+INTERFACESv4="vlan200"
+
+Открыть:
+nano /etc/dhcp/dhcpd.conf
+
+Добавить/настроить:
+option domain-name "au-team.irpo";
+option domain-name-servers 192.168.100.2;
+default-lease-time 600;
+max-lease-time 7200;
+authoritative;
+
+subnet 192.168.200.0 netmask 255.255.255.240 {
+    range 192.168.200.5 192.168.200.14;
+    option routers 192.168.200.1;
+    option subnet-mask 255.255.255.240;
+    option domain-name "au-team.irpo";
+    option domain-name-servers 192.168.100.2;
+}
+
+Сохранить. Перезапустить DHCP:
+systemctl restart isc-dhcp-server
+systemctl enable isc-dhcp-server
+systemctl status isc-dhcp-server
+
+На HQ-CLI открыть:
+nano /etc/network/interfaces
+
+Заменить статическую настройку на:
+auto ens3
+iface ens3 inet dhcp
+
+Установить DHCP-клиент:
+apt install -y isc-dhcp-client
+
+В гайде также задаётся идентификатор DHCP-клиента. Откройте:
+nano /etc/dhcp/dhclient.conf
+
+Добавьте в конец:
+send dhcp-client-identifier = hardware;
+
+Перезапустить сеть:
+systemctl restart networking
+
+Если адрес не обновился, запросить аренду:
+dhclient -r ens3
+dhclient ens3
+
+Проверить:
+ip -br a
+ip route
+ping -c 3 8.8.8.8
+
+Если в nmtui осталось старое подключение со статикой, удалите его через nmtui и перезапустите сеть.
+
+9. DNS НА HQ-SRV (МОДУЛЬ 1, ЗАДАНИЕ 10)
+
+На HQ-SRV:
+apt install -y dnsmasq
+
+Открыть:
+nano /etc/dnsmasq.conf
+
+Настроить параметры:
+interface=ens3
+domain=au-team.irpo
+server=8.8.8.8
+listen-address=192.168.100.2
+no-resolv
+no-hosts
+
+Добавить DNS-записи для имён устройств из таблицы адресации:
+address=/isp.au-team.irpo/172.16.1.1
+address=/hq-rtr.au-team.irpo/192.168.100.1
+address=/hq-srv.au-team.irpo/192.168.100.2
+address=/hq-cli.au-team.irpo/192.168.200.5
+address=/br-rtr.au-team.irpo/172.16.2.2
+address=/br-fw.au-team.irpo/172.16.10.2
+address=/br-srv.au-team.irpo/172.16.20.2
+
+Обратные записи PTR и дополнительные записи для Samba AD в гайде задаются в этом же файле. Для домена AD добавляется пересылка:
+server=/au-team.irpo/172.16.20.2
+
+Сохранить. На HQ-SRV:
+nano /etc/resolv.conf
+
+Указать:
+nameserver 127.0.0.1
+
+Перезапустить:
+systemctl restart dnsmasq
+systemctl enable dnsmasq
+
+На всех устройствах, кроме ISP и HQ-SRV, открыть:
+nano /etc/resolv.conf
+
+Указать:
+nameserver 192.168.100.2
+
+Проверка с узлов:
+ping -c 3 hq-srv.au-team.irpo
+
+10. ЧАСОВОЙ ПОЯС (МОДУЛЬ 1, ЗАДАНИЕ 11)
+
+На всех устройствах, кроме виртуального коммутатора:
+timedatectl set-timezone Asia/Krasnoyarsk
+
+Проверка:
+timedatectl
+
+МОДУЛЬ 2. ОРГАНИЗАЦИЯ СЕТЕВОГО АДМИНИСТРИРОВАНИЯ
+
+11. SAMBA AD DC НА BR-SRV (МОДУЛЬ 2, ЗАДАНИЕ 1)
+
+ВАЖНО: на BR-SRV в /etc/resolv.conf должен быть nameserver 192.168.100.2.
+
+На BR-SRV установить пакеты:
+apt update
+apt install -y samba smbclient winbind libnss-winbind krb5-user net-tools samba-ad-provision
+
+При настройке krb5-user укажите:
+Realm: AU-TEAM.IRPO
+KDC: br-srv.au-team.irpo
+Административный сервер: br-srv.au-team.irpo
+
+Удалить стандартную конфигурацию:
+mv /etc/samba/smb.conf /etc/samba/smb.conf.bak
+
+Остановить службы:
+systemctl stop smbd nmbd winbind
+
+Создать домен:
+samba-tool domain provision
+
+В мастере:
+- Realm: AU-TEAM.IRPO
+- Domain: AU-TEAM
+- Server Role: dc
+- DNS backend: SAMBA_INTERNAL
+- DNS forwarder: 192.168.100.2 (если запрашивается)
+- Administrator password: P@ssw0rd
+Остальные значения — по умолчанию (Enter), как указано в гайде.
+
+Настроить политику паролей:
+samba-tool domain passwordsettings set --min-pwd-length=8
+samba-tool domain passwordsettings set --account-lockout-threshold=5
+samba-tool domain passwordsettings set --account-lockout-duration=30
+samba-tool domain passwordsettings set --reset-account-lockout-after=30
+
+Запуск служб:
+systemctl unmask samba-ad-dc
+systemctl enable --now samba-ad-dc
+
+Скопировать Kerberos-конфиг:
+cp /var/lib/samba/private/krb5.conf /etc/krb5.conf
+
+Создать группу:
+samba-tool group add hq
+
+Создать пользователей:
+samba-tool user create hquser1 P@ssw0rd
+samba-tool user create hquser2 P@ssw0rd
+samba-tool user create hquser3 P@ssw0rd
+samba-tool user create hquser4 P@ssw0rd
+samba-tool user create hquser5 P@ssw0rd
+
+Добавить пользователей в группу:
+samba-tool group addmembers hq hquser1
+samba-tool group addmembers hq hquser2
+samba-tool group addmembers hq hquser3
+samba-tool group addmembers hq hquser4
+samba-tool group addmembers hq hquser5
+
+11.1. Ввести HQ-CLI в домен
+
+На HQ-CLI:
+apt install -y realmd sssd sssd-tools libnss-sss libpam-sss adcli packagekit krb5-user samba-common
+
+При запросах krb5-user:
+AU-TEAM.IRPO
+br-srv.au-team.irpo
+br-srv.au-team.irpo
+
+Ввести в домен:
+realm join -U administrator au-team.irpo
+
+Пароль Administrator: P@ssw0rd
+
+Включить автоматическое создание домашних каталогов:
+pam-auth-update --enable mkhomedir
+
+Разрешить вход:
+realm permit --all
+
+Настроить sudo для группы hq:
+nano /etc/sudoers.d/hq-users
+
+Добавить строку:
+%hq@au-team.irpo ALL=(ALL) /usr/bin/cat, /usr/bin/grep, /usr/bin/id
+
+Сохранить. Проверить:
+su - hquser1@au-team.irpo
+sudo id
+
+Пользователь должен иметь возможность запускать через sudo только cat, grep и id.
+
+12. CHRONY НА ISP И КЛИЕНТАХ (МОДУЛЬ 2, ЗАДАНИЕ 4)
+
+На ISP, HQ-SRV, HQ-CLI, BR-RTR, BR-SRV:
+apt install -y chrony
+
+12.1. ISP — сервер времени
+
+nano /etc/chrony/chrony.conf
+
+Закомментировать строку pool (поставить # в начале).
+
+В конец добавить:
+server ntp1.vniiftri.ru iburst prefer
+minstratum 5
+local stratum 5
+allow 0.0.0.0/0
+
+Перезапустить:
+systemctl restart chronyd
+
+Проверить:
+chronyc sources
+
+12.2. HQ-SRV и HQ-CLI
+
+В каждом:
+nano /etc/chrony/chrony.conf
+
+Закомментировать pool.
+В конец:
+server 172.16.1.1 iburst
+
+Перезапустить:
+systemctl restart chronyd
+
+Проверить:
+chronyc sources
+
+12.3. BR-RTR и BR-SRV
+
+На каждом:
+nano /etc/chrony/chrony.conf
+
+Закомментировать pool.
+В конец:
+server 172.16.2.1 iburst
+
+Перезапустить:
+systemctl restart chronyd
+
+Проверить:
+chronyc sources
+
+13. ANSIBLE НА BR-SRV (МОДУЛЬ 2, ЗАДАНИЕ 5)
+
+На HQ-CLI, BR-FW и BR-RTR установить SSH:
+apt install -y openssh-server
+
+На HQ-CLI и BR-FW создать пользователя sshuser и выдать sudo:
+useradd -m sshuser
+passwd sshuser
+usermod -aG sudo sshuser
+
+Пароль: P@ssw0rd
+
+На BR-SRV:
+apt install -y ansible sshpass
+mkdir -p /etc/ansible
+
+Отключить подтверждение SSH:
+nano /etc/ansible/ansible.cfg
+
+Содержимое:
+[defaults]
+host_key_checking=False
+
+Создать инвентарь:
+nano /etc/ansible/hosts
+
+Внести:
+
+[all]
+hq-rtr ansible_host=192.168.100.1 ansible_user=net_admin ansible_password=P@ssw0rd
+hq-srv ansible_host=192.168.100.2 ansible_user=sshuser ansible_password=P@ssw0rd ansible_port=2027
+hq-cli ansible_host=192.168.200.5 ansible_user=sshuser ansible_password=P@ssw0rd
+br-rtr ansible_host=172.16.2.2 ansible_user=net_admin ansible_password=P@ssw0rd
+br-fw ansible_host=172.16.10.2 ansible_user=sshuser ansible_password=P@ssw0rd
+
+[all:vars]
+ansible_python_interpreter=/usr/bin/python3
+ansible_become_password=P@ssw0rd
+
+Сохранить. Проверить:
+ansible all -m ping
+
+В задании инвентаризации требуются HQ-SRV, HQ-CLI, HQ-RTR и BR-RTR. Дополнительные узлы можно оставить в инвентаре, если они нужны для других действий. Для ответа pong у каждого хоста должны работать SSH и учётная запись из инвентаря.
+
+14. DOCKER НА BR-SRV (МОДУЛЬ 2, ЗАДАНИЕ 6)
+
+На BR-SRV:
+apt install -y docker.io docker-compose
+
+Скачать Additional.iso:
+wget http://192.168.227.92:8081/Additional.iso
+
+Извлечь образ через Xarchiver в /root. В результате должна появиться папка /root/Additional.
+
+Загрузить образы:
+docker image load -i /root/Additional/docker/site_latest.tar
+docker image load -i /root/Additional/docker/mariadb_latest.tar
+
+Проверить:
+docker images
+
+Создать папку проекта:
+mkdir /root/testapp
+cd /root/testapp
+
+Скопировать compose:
+cp /root/Additional/compose.yaml /root/testapp/
+
+Запустить:
+docker compose up -d
+
+Проверить:
+docker ps
+
+На HQ-CLI открыть браузер:
+http://172.16.20.2:8080
+
+15. APACHE + MARIADB НА HQ-SRV (МОДУЛЬ 2, ЗАДАНИЕ 7)
+
+На HQ-SRV:
+apt install -y apache2 mariadb-server mariadb-client php8.4 php8.4-mysqli
+
+Скачать Additional.iso:
+wget http://192.168.227.92:8081/Additional.iso
+
+Извлечь в /root через Xarchiver.
+
+Скопировать дамп:
+cp /root/Additional/web/dump.sql /tmp/
+
+Открыть MariaDB:
+mysql -u root
+
+В консоли выполнить по очереди:
+CREATE DATABASE webdb;
+CREATE USER 'web'@'localhost' IDENTIFIED BY 'P@ssw0rd';
+GRANT ALL PRIVILEGES ON webdb.* TO 'web'@'localhost';
+FLUSH PRIVILEGES;
+EXIT;
+
+Импортировать дамп:
+mysql -u root webdb < /tmp/dump.sql
+
+Создать каталог сайта:
+mkdir -p /var/www/html
+
+Скопировать файлы:
+cp /root/Additional/web/index.php /var/www/html/
+cp /root/Additional/web/logo.png /var/www/html/
+
+Назначить владельца и права:
+chown -R www-data:www-data /var/www/html
+chmod -R 755 /var/www/html
+
+Удалить стандартную страницу:
+rm -f /var/www/html/index.html
+
+Открыть:
+nano /var/www/html/index.php
+
+В файле указать параметры подключения к БД:
+- имя базы: webdb
+- пользователь: web
+- пароль: P@ssw0rd
+- сервер БД: localhost
+
+Не заменяйте остальной код приложения. Сохранить.
+
+Перезапустить Apache:
+systemctl restart apache2
+systemctl enable apache2
+
+На HQ-CLI проверить:
+http://192.168.100.2/
+
+16. ПРОБРОС ПОРТОВ (МОДУЛЬ 2, ЗАДАНИЕ 8)
+
+Задача:
+- HQ-RTR: внешний порт 8080 → HQ-SRV:80
+- HQ-RTR: внешний порт 2027 → HQ-SRV:2027
+- BR-RTR: внешний порт 8080 → BR-SRV:8080
+- BR-RTR: внешний порт 2027 → BR-SRV:2027
+
+В исходном PDF для этого задания приведены скриншоты конфигураций nftables. Используйте DNAT в таблице nat, цепочке prerouting. Общий принцип правила:
+iifname "ens3" tcp dport 8080 dnat to 192.168.100.2:80
+iifname "ens3" tcp dport 2027 dnat to 192.168.100.2:2027
+
+На HQ-RTR эти правила направляют трафик к HQ-SRV. Для BR-RTR назначения должны быть адресом BR-SRV 172.16.20.2:
+iifname "ens3" tcp dport 8080 dnat to 172.16.20.2:8080
+iifname "ens3" tcp dport 2027 dnat to 172.16.20.2:2027
+
+После изменения /etc/nftables.conf применить:
+nft -f /etc/nftables.conf
+
+Проверка с ISP:
+ssh sshuser@172.16.1.2 -p 2027
+ssh sshuser@172.16.2.2 -p 2027
+
+Проверка сайтов из браузера:
+http://172.16.1.2:8080
+http://172.16.2.2:8080
+
+17. УСТАНОВКА ЯНДЕКС БРАУЗЕРА (МОДУЛЬ 2, ЗАДАНИЕ 9)
+
+На HQ-CLI скачайте пакет Yandex.deb из интернета и переместите его в /root.
+
+Установить:
+apt install -y ./Yandex.deb
+
+Запустить:
+yandex-browser-stable --no-sandbox
+
+МОДУЛЬ 3. ЭКСПЛУАТАЦИЯ ОБЪЕКТОВ СЕТЕВОЙ ИНФРАСТРУКТУРЫ
+
+18. ИМПОРТ ПОЛЬЗОВАТЕЛЕЙ (МОДУЛЬ 3, ЗАДАНИЕ 1)
+
+На BR-SRV откройте папку Additional, в корне которой лежит import.sh и users.csv.
+
+Перейти:
+cd /root/Additional
+
+Запустить импорт:
+bash import.sh
+
+Если скрипт просит путь к CSV, укажите:
+ /root/Additional/users.csv
+
+Проверить список пользователей домена:
+samba-tool user list
+
+На HQ-CLI проверить вход под одной из импортированных учётных записей.
+
+19. NGINX REVERSE PROXY НА ISP (МОДУЛЬ 3, ЗАДАНИЕ 2)
+
+На ISP:
+apt install -y nginx
+
+Создать конфигурацию:
+nano /etc/nginx/sites-available/proxy
+
+В конфигурации должны быть два виртуальных сервера:
+- web.au-team.irpo → http://172.16.1.2:8080
+- docker.au-team.irpo → http://172.16.2.2:8080
+
+Пример HTTP-конфигурации:
+
+server {
+    listen 80;
+    server_name web.au-team.irpo;
+    location / {
+        proxy_pass http://172.16.1.2:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+}
+
+server {
+    listen 80;
+    server_name docker.au-team.irpo;
+    location / {
+        proxy_pass http://172.16.2.2:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+}
+
+Активировать:
+ln -s /etc/nginx/sites-available/proxy /etc/nginx/sites-enabled/proxy
+rm -f /etc/nginx/sites-enabled/default
+
+Открыть основной конфиг:
+nano /etc/nginx/nginx.conf
+
+Найти строку server_names_hash_bucket_size 64; и убрать #.
+
+Проверить и перезапустить:
+nginx -t
+systemctl restart nginx
+
+На HQ-CLI для проверки откройте:
+http://web.au-team.irpo
+http://docker.au-team.irpo
+
+Для разрешения этих имён клиент должен использовать DNS HQ-SRV и записи web/docker должны разрешаться в адрес ISP 172.16.1.1. Если записи отсутствуют, добавьте на HQ-SRV в dnsmasq:
+address=/web.au-team.irpo/172.16.1.1
+address=/docker.au-team.irpo/172.16.1.1
+Затем:
+systemctl restart dnsmasq
+
+20. WEB-BASED АУТЕНТИФИКАЦИЯ (МОДУЛЬ 3, ЗАДАНИЕ 3)
+
+На ISP установить утилиту для htpasswd:
+apt install -y apache2-utils
+
+Создать файл паролей:
+htpasswd -c /etc/nginx/.htpasswd WEB
+
+Задать пароль:
+P@ssw0rd
+
+Открыть конфиг:
+nano /etc/nginx/sites-enabled/proxy
+
+В блок server для web.au-team.irpo, внутрь location / добавить:
+auth_basic "Restricted Access";
+auth_basic_user_file /etc/nginx/.htpasswd;
+
+Перезапустить:
+nginx -t
+systemctl restart nginx
+
+Проверить на HQ-CLI:
+http://web.au-team.irpo
+
+Логин WEB, пароль P@ssw0rd.
+
+21. ЦЕНТР СЕРТИФИКАЦИИ НА HQ-SRV (МОДУЛЬ 3, ЗАДАНИЕ 4)
+
+На HQ-SRV:
+mkdir -p /root/ca
+cd /root/ca
+
+Создать ключ CA:
+openssl genrsa -out ca.key 2048
+
+Создать самоподписанный сертификат CA:
+openssl req -x509 -new -nodes -key ca.key -sha256 -days 365 -out ca.crt -subj "/CN=au-team.irpo"
+
+Создать ключ и CSR для web:
+openssl req -newkey rsa:2048 -nodes -keyout web.key -out web.csr -subj "/CN=web.au-team.irpo" -addext "subjectAltName=DNS:web.au-team.irpo"
+
+Подписать сертификат web на 30 дней:
+openssl x509 -req -in web.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out web.crt -days 30 -sha256 -copy_extensions copy
+
+Создать ключ и CSR для docker:
+openssl req -newkey rsa:2048 -nodes -keyout docker.key -out docker.csr -subj "/CN=docker.au-team.irpo" -addext "subjectAltName=DNS:docker.au-team.irpo"
+
+Подписать сертификат docker на 30 дней:
+openssl x509 -req -in docker.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out docker.crt -days 30 -sha256 -copy_extensions copy
+
+На ISP установить SSH и создать каталог:
+apt install -y openssh-server
+mkdir -p /etc/nginx/ssl
+
+Разрешить root SSH-доступ (временная передача файлов):
+nano /etc/ssh/sshd_config
+
+Добавить/раскомментировать:
+PermitRootLogin yes
+
+Перезапустить:
+systemctl restart ssh
+
+С HQ-SRV скопировать пять файлов на ISP:
+scp /root/ca/*.crt /root/ca/*.key root@172.16.1.1:/etc/nginx/ssl/
+
+Пароль root на ISP — тот, который задан для этой ВМ.
+
+На ISP отредактировать конфиг:
+nano /etc/nginx/sites-enabled/proxy
+
+Настроить HTTPS-серверы на порту 443:
+для web:
+listen 443 ssl;
+server_name web.au-team.irpo;
+ssl_certificate /etc/nginx/ssl/web.crt;
+ssl_certificate_key /etc/nginx/ssl/web.key;
+auth_basic "Restricted Access";
+auth_basic_user_file /etc/nginx/.htpasswd;
+location / {
+    proxy_pass http://172.16.1.2:8080;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+}
+
+для docker:
+listen 443 ssl;
+server_name docker.au-team.irpo;
+ssl_certificate /etc/nginx/ssl/docker.crt;
+ssl_certificate_key /etc/nginx/ssl/docker.key;
+location / {
+    proxy_pass http://172.16.2.2:8080;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header Accept-Encoding "";
+    sub_filter 'http://docker.au-team.irpo' 'https://docker.au-team.irpo';
+    sub_filter_once off;
+}
+
+Проверить:
+nginx -t
+systemctl restart nginx
+
+С HQ-SRV скопировать CA на HQ-CLI:
+scp /root/ca/ca.crt sshuser@192.168.200.5:/tmp/
+
+На HQ-CLI запустить Яндекс.Браузер:
+yandex-browser-stable --no-sandbox
+
+В адресной строке:
+browser://settings/certificates
+
+Далее:
+1) «Локальные сертификаты».
+2) «Установленные вами».
+3) В «Доверенных сертификатах» нажать «Импорт».
+4) Ctrl+L, путь /tmp/, выбрать ca.crt.
+5) Убедиться, что появился сертификат au-team.irpo.
+6) Полностью закрыть браузер и открыть заново.
+
+Проверить:
+https://web.au-team.irpo
+https://docker.au-team.irpo
+
+Для web ввести WEB / P@ssw0rd. Предупреждений сертификата быть не должно.
+
+22. ATOP НА HQ-SRV (МОДУЛЬ 3, ЗАДАНИЕ 5)
+
+На HQ-SRV:
+apt install -y atop
+
+Установить интервал 420 секунд:
+sed -i 's/^LOGINTERVAL=.*/LOGINTERVAL=420/' /etc/default/atop
+
+Перезапустить и включить автозапуск:
+systemctl restart atop
+systemctl enable atop
+
+Проверить:
+systemctl status atop
+grep LOGINTERVAL /etc/default/atop
+
+Ожидается active (running) и LOGINTERVAL=420.
+
+23. CUPS — ПРИНТ-СЕРВЕР (МОДУЛЬ 3, ЗАДАНИЕ 6)
+
+На HQ-SRV:
+apt install -y cups printer-driver-cups-pdf
+
+Открыть:
+nano /etc/cups/cupsd.conf
+
+Изменить:
+Listen localhost:631
+на:
+Port 631
+
+Для доступа в конфигурации разрешить подключения к серверу:
+<Location />
+  Order allow,deny
+  Allow all
+</Location>
+
+Перезапустить и включить:
+systemctl restart cups
+systemctl enable cups
+
+Проверить PDF-принтер:
+lpstat -p -d
+
+На HQ-CLI:
+apt install -y cups-client
+
+Добавить принтер:
+lpadmin -p PDF -E -v ipp://192.168.100.2:631/printers/PDF
+
+Сделать принтером по умолчанию:
+lpadmin -d PDF
+
+Проверить:
+lpstat -d
+
+24. ANSIBLE INVENTORY / ОТЧЁТЫ PC-INFO (МОДУЛЬ 3, ЗАДАНИЕ 7)
+
+На BR-SRV создать папку:
+mkdir -p /etc/ansible/PC-INFO
+
+Скопировать готовый playbook из Additional.iso:
+cp /root/Additional/playbook/get_hostname_address.yml /etc/ansible/
+
+Запустить:
+ansible-playbook -i /etc/ansible/hosts /etc/ansible/get_hostname_address.yml
+
+Проверить:
+ls -l /etc/ansible/PC-INFO/
+cat /etc/ansible/PC-INFO/hq-srv.yml
+cat /etc/ansible/PC-INFO/hq-cli.yml
+
+Должны появиться два YAML-отчёта с именами устройств, hostname и IP-адресами.
+
+25. FAIL2BAN НА HQ-SRV (МОДУЛЬ 3, ЗАДАНИЕ 8)
+
+На HQ-SRV:
+apt install -y fail2ban
+
+Создать локальный конфиг:
+nano /etc/fail2ban/jail.local
+
+Содержимое:
+[sshd]
+enabled = true
+port = 2027
+maxretry = 3
+bantime = 1m
+
+Перезапустить и включить:
+systemctl restart fail2ban
+systemctl enable fail2ban
+
+Проверить:
+fail2ban-client status sshd
+
+Для теста с HQ-CLI трижды подключиться с неверным паролем:
+ssh sshuser@192.168.100.2 -p 2027
+
+Затем на HQ-SRV:
+fail2ban-client status sshd
+
+В гайде указано, что из-за NAT адрес в бан-листе может отображаться как 192.168.100.1 — это ожидаемо.
+
+26. URBACKUP — РЕЗЕРВНОЕ КОПИРОВАНИЕ (МОДУЛЬ 3, ЗАДАНИЕ 9)
+
+В гайде вместо Кибер Бэкап используется функциональный аналог UrBackup.
+
+26.1. HQ-SRV — установить сервер
+
+wget https://hndl.urbackup.org/Server/latest/urbackup-server_amd64.deb -O /tmp/urbackup-server.deb
+apt install -y /tmp/urbackup-server.deb
+
+При установке указать каталог для бэкапов:
+ /backup
+
+26.2. HQ-CLI — подготовить хранилище
+
+mkdir -p /backup
+chmod 777 /backup
+
+26.3. HQ-SRV — примонтировать хранилище HQ-CLI
+
+apt install -y sshfs
+
+Остановить UrBackup перед монтированием:
+systemctl stop urbackupsrv
+
+Создать точку монтирования и смонтировать папку:
+mkdir -p /backup
+sshfs -o allow_other,default_permissions sshuser@192.168.200.5:/backup /backup
+
+Если IP HQ-CLI отличается, замените 192.168.200.5 на фактический.
+
+Запустить UrBackup обратно:
+systemctl start urbackupsrv
+
+26.4. Веб-интерфейс UrBackup
+
+На HQ-CLI открыть:
+http://192.168.100.2:55414
+
+Создать пользователя:
+Логин irpoadmin
+Пароль P@ssw0rd
+Права администратора — включить.
+
+Создать группу клиентов:
+irpo
+
+Проверить в Настройки → Сервер, что путь к хранилищу резервных копий:
+ /backup
+
+26.5. Установить клиент на HQ-SRV
+
+На HQ-SRV скачать/установить UrBackup Client с официального источника или доступного установочного файла из набора. В веб-интерфейсе на HQ-CLI открыть «Статус» → «Добавить клиента» и подключить HQ-SRV.
+
+В настройках клиента:
+Настройки → Настройки клиента → Файловые бэкапы.
+Каталоги для бэкапа:
+/etc
+Группа:
+irpo
+Сохранить.
+
+На вкладке «Статус» запустить файловую резервную копию.
+
+Проверить на HQ-CLI:
+ls -la /backup/
+ls -la /backup/hq-srv.au-team.irpo/
+
+МОДУЛЬ 4. ДИАГНОСТИКА И ОБСЛУЖИВАНИЕ
+
+27. IPERF3 — ТЕСТ СКОРОСТИ (ЗАДАНИЕ 1)
+
+На HQ-SRV:
+apt install -y iperf3
+
+Если установщик спрашивает об автоматическом запуске сервера, ответить «Нет».
+
+Запустить сервер:
+iperf3 -s
+
+Оставить процесс работающим.
+
+На BR-SRV:
+apt install -y iperf3
+
+Запустить тест через GRE к HQ-SRV и сохранить результат:
+iperf3 -c 10.10.10.1 -t 10 > /tmp/speedtest.txt
+
+Проверить файл:
+cat /tmp/speedtest.txt
+
+28. CRON — ЕЖЕДНЕВНЫЙ ПЕРЕЗАПУСК DNSMASQ (ЗАДАНИЕ 2)
+
+На HQ-SRV:
+crontab -e
+
+В конец добавить:
+0 8 * * * systemctl restart dnsmasq
+
+Сохранить.
+
+Проверить:
+crontab -l
+systemctl status cron
+
+Должно быть active (running), а в расписании — строка:
+0 8 * * * systemctl restart dnsmasq
+
+29. ANSIBLE — АВТОВОССТАНОВЛЕНИЕ FRR (ЗАДАНИЕ 3)
+
+На BR-SRV скачать playbook:
+wget http://192.168.227.92:8081/frr_recovery.yml -O /etc/ansible/frr_recovery.yml
+
+Запустить:
+ansible-playbook -i /etc/ansible/hosts /etc/ansible/frr_recovery.yml
+
+Playbook должен создать на HQ-RTR, BR-RTR и BR-FW:
+- /opt/scripts/restart_frr.sh
+- /etc/systemd/system/frr-recovery.service
+- включить frr-recovery.service в автозагрузку.
+
+Проверка на маршрутизаторах:
+systemctl status frr-recovery.service
+systemctl is-enabled frr-recovery.service
+cat /opt/scripts/restart_frr.sh
+cat /etc/systemd/system/frr-recovery.service
+
+30. HTOP — МОНИТОРИНГ APACHE (ЗАДАНИЕ 4)
+
+На HQ-SRV:
+apt install -y htop
+
+Запустить:
+htop
+
+Внутри htop:
+1) Нажать F4 (Filter).
+2) Ввести apache2.
+3) Нажать Enter.
+4) Сделать скриншот для отчёта.
+
+31. ЖУРНАЛ НЕУДАЧНЫХ SSH-ВХОДОВ (ЗАДАНИЕ 5)
+
+На HQ-SRV создать файл отчёта:
+grep "Failed password" /var/log/auth.log > /tmp/failed_logins.txt
+
+Проверить:
+ls -l /tmp/failed_logins.txt
+cat /tmp/failed_logins.txt
+
+Даже если неудачных попыток не было, файл должен существовать. Команда grep с перенаправлением создаёт его в любом случае.
+
+32. ФИНАЛЬНЫЕ ПРОВЕРКИ
+
+Сеть:
+ip -br a
+ip route
+ping -c 3 8.8.8.8
+
+DNS:
+ping -c 3 hq-srv.au-team.irpo
+getent hosts web.au-team.irpo
+getent hosts docker.au-team.irpo
+
+GRE:
+ping -c 3 10.10.10.1
+ping -c 3 10.10.10.2
+
+OSPF:
+vtysh -c "show ip ospf neighbor"
+vtysh -c "show ip route ospf"
+
+DHCP на HQ-CLI:
+ip -br a
+
+SSH:
+ssh sshuser@192.168.100.2 -p 2027
+
+Docker на BR-SRV:
+docker ps
+
+Apache на HQ-SRV:
+systemctl status apache2
+
+DNS:
+systemctl status dnsmasq
+
+NTP:
+chronyc sources
+
+Ansible:
+ansible all -m ping
+
+UrBackup:
+проверить веб-интерфейс http://192.168.100.2:55414 и наличие файлов резервной копии на HQ-CLI.
+
+ВАЖНЫЕ ЗАМЕЧАНИЯ ПО ИСХОДНОМУ PDF
+
+1) В оригинальном PDF часть содержимого конфигурационных файлов показана только на скриншотах. Для таких мест текстовое распознавание не всегда передаёт каждую строку. Сверяйте спорные фрагменты с соответствующей страницей исходного PDF.
+2) В заданиях с Additional.iso обязательны именно файлы из образа: compose.yaml, Docker tar-образы, import.sh, users.csv, get_hostname_address.yml. Не заменяйте их произвольными файлами.
+3) В сетевых заданиях сначала добейтесь базовой связности и DNS, только после этого переходите к Samba, Ansible, веб-приложениям и сертификатам.
+4) После изменения /etc/network/interfaces проверяйте ip -br a и ip route. Ошибка в имени интерфейса может полностью отключить связь.
+5) Пароль root из начального входа, пароли пользователей и пароль администратора Samba — разные учётные записи. Не путайте их.
